@@ -21,6 +21,7 @@ created by going through the Command Line Interface with the ``yank script`` com
 
 import collections
 import copy
+import gc
 import logging
 import os
 
@@ -489,8 +490,10 @@ class Experiment(object):
                     iterations_left[phase_id] -= iterations_to_run
                 self._phases_last_iterations[phase_id] = alchemical_phase.iteration
 
-                # Delete alchemical phase and prepare switching.
+                # Delete alchemical phase and prepare switching. We force garbage
+                # collection to make sure that everything finalizes correctly.
                 del alchemical_phase
+                gc.collect()
 
 
 class ExperimentBuilder(object):
@@ -1302,6 +1305,10 @@ class ExperimentBuilder(object):
                     required: yes
                     type: string
                     nullable: yes
+                net_charge:
+                    required: no
+                    type: integer
+                    nullable: yes
         select:
             required: no
             dependencies: filepath
@@ -1339,15 +1346,6 @@ class ExperimentBuilder(object):
         modeller:
             required: no
             dependencies: filepath
-        openeye:
-            required: no
-            excludes: filepath
-        antechamber:
-            required: no
-            excludes: filepath
-        epik:
-            required: no
-            excludes: filepath
         """
         peptide_schema = {**yaml.load(peptide_schema_yaml), **common_molecules_schema}
 
@@ -1599,9 +1597,10 @@ class ExperimentBuilder(object):
                 # Phases names must be unambiguous, they can't contain both names
                 phase1 = [(k, v) for k, v in protocol.items()
                           if (sortable[0] in k and sortable[1] not in k)]
+                logger.debug(phase1)
                 phase2 = [(k, v) for k, v in protocol.items()
                           if (sortable[1] in k and sortable[0] not in k)]
-
+                logger.debug(phase2)
                 # Phases names must be unique
                 if len(phase1) == 1 and len(phase2) == 1:
                     return collections.OrderedDict([phase1[0], phase2[0]])
@@ -1667,9 +1666,8 @@ class ExperimentBuilder(object):
         # Validate the top level keys (cannot be done with Cerberus)
         def validate_protocol_keys_and_values(protocol_id, protocol):
             # Ensure the protocol is 2 keys
-            if len(protocol) != 2:
-                raise YamlParseError('Protocol {} must only have two phases, found {}'.format(protocol_id,
-                                                                                              len(protocol)))
+            if len(protocol) == 1:
+                logger.debug('coupled top')
             # Ensure the protocol keys are in fact strings
             keys_not_strings = []
             key_string_error = 'Protocol {} has keys which are not strings: '.format(protocol_id)
@@ -1680,8 +1678,17 @@ class ExperimentBuilder(object):
                 # The join(list_comprehension) forces invalid keys to a string so the join command works
                 raise YamlParseError(key_string_error + ', '.join(['{}'.format(key) for key in keys_not_strings]))
             # Check for ordered dict or the sorted keys
-            if not isinstance(protocol, collections.OrderedDict):
-                protocol = sort_protocol(protocol)
+            if len(protocol) == 1:
+                try:
+                    dummy = protocol['coupled']
+                    protocol = collections.OrderedDict(protocol)
+                except:
+                    raise ValueError('Only one phase present are you performing a coupled topologies calculation? '
+                                     'If so please rename phase to coupled')
+            else:
+                if not isinstance(protocol, collections.OrderedDict):
+                    protocol = sort_protocol(protocol)
+
             # Now user cerberus to validate the alchemical path part
             errored_phases = []
             for phase_key, phase_entry in protocol.items():
@@ -1810,6 +1817,7 @@ class ExperimentBuilder(object):
             oneof:
                 - dependencies: [phase1_path, phase2_path]
                 - dependencies: [receptor, ligand]
+                - dependencies: [receptor, A, B]
         solvent1:
             required: no
             type: string
@@ -1833,16 +1841,30 @@ class ExperimentBuilder(object):
         receptor:
             required: no
             type: string
-            dependencies: [ligand, solvent]
             allowed: MOLECULE_IDS_POPULATED_AT_RUNTIME
             excludes: [solute, phase1_path, phase2_path]
             validator: REGION_CLASH_DETERMINED_AT_RUNTIME_WITH_LIGAND
+            oneof:
+                - dependencies: [solvent, A, B]
+                - dependencies: [solvent, ligand]
         ligand:
             required: no
             type: string
             dependencies: [receptor, solvent]
             allowed: MOLECULE_IDS_POPULATED_AT_RUNTIME
-            excludes: [solute, phase1_path, phase2_path]
+            excludes: [solute, phase1_path, phase2_path, A, B]
+        A:
+            required: no
+            type: string
+            dependencies: [receptor, solvent, B]
+            allowed: MOLECULE_IDS_POPULATED_AT_RUNTIME
+            excludes: [solute, phase1_path, phase2_path, ligand]       
+        B:
+            required: no
+            type: string
+            dependencies: [receptor, solvent, A]
+            allowed: MOLECULE_IDS_POPULATED_AT_RUNTIME
+            excludes: [solute, phase1_path, phase2_path, ligand]         
         pack:
             # Technically requires receptor, but with default interjects itself even if receptor is not present
             required: no
@@ -1869,7 +1891,7 @@ class ExperimentBuilder(object):
         system_schema = {**system_schema, **leap_schema}
         # Handle the populations
         # Molecules
-        for molecule_id_key in ['receptor', 'ligand', 'solute']:
+        for molecule_id_key in ['receptor', 'ligand', 'solute', 'A', 'B']:
             system_schema[molecule_id_key]['allowed'] = [str(key) for key in self._db.molecules.keys()]
         # Solvents
         for solvent_id_key in ['solvent', 'solvent1', 'solvent2']:
@@ -2238,8 +2260,12 @@ class ExperimentBuilder(object):
                 elif not is_sys_setup:  # then this must go through the pipeline
                     try:  # binding free energy system
                         receptor_id = self._db.systems[system_id]['receptor']
-                        ligand_id = self._db.systems[system_id]['ligand']
-                        molecule_ids = [receptor_id, ligand_id]
+                        try:
+                            ligand_id = self._db.systems[system_id]['ligand']
+                            molecule_ids = [receptor_id, ligand_id]
+                        except:
+                            ligand_id = self._db.systems[system_id]['A']
+                            molecule_ids = [receptor_id, ligand_id]
                     except KeyError:  # partition/solvation free energy system
                         molecule_ids = [self._db.systems[system_id]['solute']]
                     for molecule_id in molecule_ids:
@@ -2421,6 +2447,7 @@ class ExperimentBuilder(object):
         assert isinstance(protocol, collections.OrderedDict)
         phases_to_generate = []
         for phase_name in protocol:
+            print(phase_name)
             if protocol[phase_name]['alchemical_path'] == 'auto':
                 phases_to_generate.append(phase_name)
         return phases_to_generate
@@ -2554,6 +2581,7 @@ class ExperimentBuilder(object):
             sampler_state = alchemical_phase._sampler._sampler_states[0]
             mcmc_move = alchemical_phase._sampler.mcmc_moves[0]
             del alchemical_phase
+            gc.collect()
 
             # Restrain the receptor heavy atoms to avoid drastic
             # conformational changes (possibly after equilibration).
@@ -2625,6 +2653,13 @@ class ExperimentBuilder(object):
                 solvent_ids = []
         sol_section = {sol_id: self._expanded_raw_yaml['solvents'][sol_id]
                        for sol_id in solvent_ids}
+
+        # Coupled Toploogies section data
+
+
+
+
+
 
         # Systems section data
         system_id = experiment['system']
@@ -2736,7 +2771,10 @@ class ExperimentBuilder(object):
     @staticmethod
     def _save_analysis_script(results_dir, phase_names):
         """Store the analysis information about phase signs for analyze."""
-        analysis = [[phase_names[0], 1], [phase_names[1], -1]]
+        try:
+            analysis = [[phase_names[0], 1], [phase_names[1], -1]]
+        except:
+            analysis = [[phase_names[0], 1]]
         analysis_script_path = os.path.join(results_dir, 'analysis.yaml')
         with open(analysis_script_path, 'w') as f:
             yaml.dump(analysis, f)
@@ -2898,7 +2936,8 @@ class ExperimentBuilder(object):
         if mcmc_move_id is None:
             mcmc_move = self._create_default_mcmc_move(experiment_description, default_mc_atoms)
         else:
-            mcmc_move = schema.call_mcmc_move_constructor(self._mcmc_moves[mcmc_move_id])
+            mcmc_move = schema.call_mcmc_move_constructor(self._mcmc_moves[mcmc_move_id],
+                                                          atom_subset=default_mc_atoms)
         constructor_description['mcmc_moves'] = mcmc_move
         # Create the sampler.
         return schema.call_sampler_constructor(constructor_description)
@@ -2947,8 +2986,14 @@ class ExperimentBuilder(object):
             try:
                 ligand_dsl = self._db.systems[system_id]['ligand_dsl']
             except KeyError:
-                # This is a solvation free energy.
-                pass
+                try:
+                    #if B is defined A must be by yaml dependancy
+                    ligand_molecule_id= self._db.systems[system_id]['B']
+                    print(ligand_molecule_id, ligand_molecule_id)
+                except KeyError:
+                    #solvation
+                    pass
+
         else:
             # Make sure that molecule filepath points to the mol2 file
             self._db.is_molecule_setup(ligand_molecule_id)
@@ -2974,7 +3019,10 @@ class ExperimentBuilder(object):
         try:  # binding free energy calculations
             solvent_ids = [system_description['solvent'],
                                   system_description['solvent']]
-            ligand_regions = self._db.molecules.get(system_description.get('ligand'), {}).get('regions', {})
+            try:
+                ligand_regions = self._db.molecules.get(system_description.get('ligand'), {}).get('regions', {})
+            except:
+                ligand_regions = self._db.molecules.get(system_description.get('A'), system_description.get('B'), {}).get('regions', {})
             receptor_regions = self._db.molecules.get(system_description.get('receptor'), {}).get('regions', {})
             # Name clashes have been resolved in the yaml validation
             regions = {'ligand_atoms': ligand_regions, 'receptor_atoms': receptor_regions}
@@ -3002,6 +3050,9 @@ class ExperimentBuilder(object):
         # order (e.g. [complex, solvent] or [solvent1, solvent2]).
         assert isinstance(protocol, collections.OrderedDict)
         phase_names = list(protocol.keys())
+
+        #CONSIDERED UP TO HERE
+
         phase_paths = self._get_nc_file_paths(experiment_path, experiment)
         for phase_idx, (phase_name, phase_path) in enumerate(zip(phase_names, phase_paths)):
             # Check if we need to resume a phase. If the phase has been
@@ -3139,3 +3190,4 @@ class ExperimentBuilder(object):
 if __name__ == "__main__":
     import doctest
     doctest.testmod()
+

@@ -78,7 +78,7 @@ class Topography(object):
     """
 
     # Built in class attributes
-    _BUILT_IN_REGIONS = ('ligand_atoms', 'ligand_atoms_one', 'receptor_atoms', 'solute_atoms', 'solvent_atoms', 'ion_atoms')
+    _BUILT_IN_REGIONS = ('ligand_atoms', 'receptor_atoms', 'solute_atoms', 'solvent_atoms', 'ion_atoms')
     _PROTECTED_REGION_NAMES = ('and', 'or')
 
     def __init__(self, topology, ligand_atoms=None, solvent_atoms='auto'):
@@ -116,7 +116,7 @@ class Topography(object):
         of the atom indices.
 
         """
-        return self._ligand_atoms
+        return copy.deepcopy(self._ligand_atoms)
 
     @ligand_atoms.setter
     def ligand_atoms(self, value):
@@ -124,32 +124,6 @@ class Topography(object):
 
         # Safety check: with a ligand there should always be a receptor.
         if len(self._ligand_atoms) > 0 and len(self.receptor_atoms) == 0:
-            raise ValueError('Specified ligand but cannot find '
-                             'receptor atoms. Ligand: {}'.format(value))
-    @property
-    def ligand_atoms_one(self):
-        """Atom indices for additional ligand if multiple alchemical regions is used
-
-        This can be empty if this :class:`Topography` doesn't represent a receptor-ligand
-        system. Use solute_atoms to obtain the atom indices of the molecule if
-        this is the case.
-
-        If assigned to a string, it will be interpreted as an mdtraj DSL specification
-        of the atom indices.
-
-        """
-        return self._ligand_atoms_one
-
-    @ligand_atoms.setter
-    def ligand_atoms_one(self, value):
-        self._ligand_atoms_one = self.select(value)
-
-        # Safety check: with a ligand there should always be a receptor.
-        if len(self._ligand_atoms_one) > 0 and len(self.receptor_atoms) == 0:
-            raise ValueError('Specified ligand but cannot find '
-                             'receptor atoms. Ligand: {}'.format(value))
-        # Safety check: If using multiple regions then ligand_atoms should be specified
-        if len(self._ligand_atoms_one) > 0 and len(self.ligand_atoms) == 0:
             raise ValueError('Specified ligand but cannot find '
                              'receptor atoms. Ligand: {}'.format(value))
 
@@ -195,7 +169,7 @@ class Topography(object):
         built from common solvent residue names.
 
         """
-        return self._solvent_atoms
+        return copy.deepcopy(self._solvent_atoms)
 
     @solvent_atoms.setter
     def solvent_atoms(self, value):
@@ -212,9 +186,11 @@ class Topography(object):
     def ions_atoms(self):
         """The indices of all ions atoms in the solvent (read-only)."""
         # Ions are all atoms of the solvent whose residue name show a charge.
+        ION_RESIDUE_NAMES = {'NA', 'CL'}
         return [i for i in self._solvent_atoms
                 if '-' in self._topology.atom(i).residue.name or
-                '+' in self._topology.atom(i).residue.name]
+                '+' in self._topology.atom(i).residue.name or
+                self._topology.atom(i).residue.name in ION_RESIDUE_NAMES]
 
     def add_region(self, region_name, region_selection, subset=None):
         """
@@ -350,6 +326,7 @@ class Topography(object):
 
         """
 
+        selection = copy.deepcopy(selection)
         # Handle subset. Define a subset topology to manipulate, then define a common call to convert subset atom
         # into absolute atom
         if subset is not None:
@@ -448,7 +425,7 @@ class Topography(object):
                     # The self here is inherited from the outer scope
                     region_output_unmapped = list(self._get_region_set(region_string))
                     region_output = [item for item in region_output_unmapped if item in atom_map]
-                except (SyntaxError, ValueError) as e:
+                except (SyntaxError, ValueError, TypeError) as e:
                     # Make this a local variable
                     region_error = e
                     region_output = None
@@ -942,8 +919,11 @@ class AlchemicalPhase(object):
             Simulation metadata to be stored in the file.
 
         """
-        print(alchemical_regions)
         # Check that protocol has same number of states for each parameter.
+        for par_name, path in protocol.items():
+            print(par_name)
+            print(path)
+            
         len_protocol_parameters = {par_name: len(path) for par_name, path in protocol.items()}
         if len(set(len_protocol_parameters.values())) != 1:
             raise ValueError('The protocol parameters have a different number '
@@ -955,8 +935,7 @@ class AlchemicalPhase(object):
         reference_system = thermodynamic_state.system
         is_periodic = thermodynamic_state.is_periodic
         is_complex = len(topography.receptor_atoms) > 0
-        is_multiple = len(topography.ligand_atoms) > 0 and len(topography.ligand_atoms_one) > 0
-        print(is_multiple)
+
         # We currently don't support reaction field.
         _, nonbonded_force = mmtools.forces.find_forces(reference_system, openmm.NonbondedForce,
                                                         only_one=True)
@@ -1033,18 +1012,12 @@ class AlchemicalPhase(object):
 
         # Handle default alchemical region.
         if alchemical_regions is None:
-            if is_multiple:
-                alchemical_regions = self._build_multiple_alchemical_region(
-                reference_system, topography, protocol)
-            else:
-                alchemical_regions = self._build_default_alchemical_region(
+            alchemical_regions = self._build_default_alchemical_region(
                 reference_system, topography, protocol)
 
         # Check that we have atoms to alchemically modify.
-        # Check for multiple regions in _build_multiple_alchemical_region()
-        if not is_multiple:
-            if len(alchemical_regions.alchemical_atoms) == 0:
-                raise ValueError("Couldn't find atoms to alchemically modify.")
+        if len(alchemical_regions.alchemical_atoms) == 0:
+            raise ValueError("Couldn't find atoms to alchemically modify.")
 
         # Create alchemically-modified system using alchemical factory.
         logger.debug("Creating alchemically-modified states...")
@@ -1055,44 +1028,26 @@ class AlchemicalPhase(object):
 
         # Create compound alchemically modified state to pass to sampler.
         thermodynamic_state.system = alchemical_system
-        if is_multiple:
-            alchemical_state_zero = mmtools.alchemy.AlchemicalState.from_system(alchemical_system, region_name = 'zero')
-            alchemical_state_one = mmtools.alchemy.AlchemicalState.from_system(alchemical_system, region_name = 'one')
-        else:
-            alchemical_state = mmtools.alchemy.AlchemicalState.from_system(alchemical_system, region_name = 'zero')
+        alchemical_state = mmtools.alchemy.AlchemicalState.from_system(alchemical_system)
         if restraint_state is not None:
-            if is_multiple:
-                composable_states = [alchemical_state_zero, alchemical_state_one, restraint_state]
-            else:
-                composable_states = [alchemical_state, restraint_state]
+            composable_states = [alchemical_state, restraint_state]
         else:
-            if is_multiple:
-                composable_states = [alchemical_state_zero, alchemical_state_one]
-            else:
-                composable_states = [alchemical_state]
+            composable_states = [alchemical_state]
         compound_state = mmtools.states.CompoundThermodynamicState(
             thermodynamic_state=thermodynamic_state, composable_states=composable_states)
 
         # Create all compound states to pass to sampler.create()
         # following the requested protocol.
-
-        if is_multiple:
-            print('Reversing protocol')
-            #if we have multiple regions we want to perform coupled topologies calculation
-            #for this protocol for regions one can be reverse of region zero
-            #this is lazy and will not work in general case.
-        else:
-            compound_states = []
-            protocol_keys, protocol_values = zip(*protocol.items())
-            for state_id, state_values in enumerate(zip(*protocol_values)):
-                compound_states.append(copy.deepcopy(compound_state))
-                for lambda_key, lambda_value in zip(protocol_keys, state_values):
-                    print(lambda_key)
-                    if hasattr(compound_state, lambda_key):
-                        setattr(compound_states[state_id], lambda_key, lambda_value)
-                    else:
-                        raise AttributeError('CompoundThermodynamicState object does not '
-                                             'have protocol attribute {}'.format(lambda_key))
+        compound_states = []
+        protocol_keys, protocol_values = zip(*protocol.items())
+        for state_id, state_values in enumerate(zip(*protocol_values)):
+            compound_states.append(copy.deepcopy(compound_state))
+            for lambda_key, lambda_value in zip(protocol_keys, state_values):
+                if hasattr(compound_state, lambda_key):
+                    setattr(compound_states[state_id], lambda_key, lambda_value)
+                else:
+                    raise AttributeError('CompoundThermodynamicState object does not '
+                                         'have protocol attribute {}'.format(lambda_key))
 
         # Temperature and pressure at the end states should
         # be the same or the analysis won't make sense.
@@ -1269,6 +1224,14 @@ class AlchemicalPhase(object):
         self._sampler.extend(n_iterations)
 
     # -------------------------------------------------------------------------
+    # Magic methods
+    # -------------------------------------------------------------------------
+
+    def __del__(self):
+        # Explicitly delete the sampler so that its reporter will close.
+        del self._sampler
+
+    # -------------------------------------------------------------------------
     # Internal-usage
     # -------------------------------------------------------------------------
 
@@ -1374,29 +1337,6 @@ class AlchemicalPhase(object):
         return thermodynamic_state
 
     @staticmethod
-    def _build_multiple_alchemical_region(system, topography, protocol):
-        alchemical_region_kwargs = {}
-
-        if len(topography.ligand_atoms) == 0 or len(topography.ligand_atoms_one) == 0:
-            raise ValueError('Need to provide two ligands for coupled topologies calculation')
-
-        alchemical_atoms = {'zero' : getattr(topography, 'ligand_atoms')
-                            ,'one' : getattr(topography, 'ligand_atoms_one')}
-        alchemical_region = []
-        for region_name, region_atoms in alchemical_atoms.items():
-            alchemical_region_kwargs['alchemical_atoms'] = region_atoms
-            # Check if we need to modify bonds/angles/torsions.
-            for element_type in ['bonds', 'angles', 'torsions']:
-                if 'lambda_' + element_type in protocol:
-                    modify_it = True
-                else:
-                    modify_it = None
-                alchemical_region_kwargs['alchemical_' + element_type] = modify_it
-            alchemical_region += mmtools.alchemy.AlchemicalRegion(**alchemical_region_kwargs, name = '{}'.format(region_name))
-
-        return alchemical_region
-
-    @staticmethod
     def _build_default_alchemical_region(system, topography, protocol):
         """Create a default AlchemicalRegion if the user hasn't provided one."""
         # TODO: we should probably have a second region that annihilate sterics of counterions.
@@ -1433,7 +1373,7 @@ class AlchemicalPhase(object):
             alchemical_region_kwargs['alchemical_' + element_type] = modify_it
 
         # Create alchemical region.
-        alchemical_region = mmtools.alchemy.AlchemicalRegion(**alchemical_region_kwargs, name = 'zero')
+        alchemical_region = mmtools.alchemy.AlchemicalRegion(**alchemical_region_kwargs)
 
         return alchemical_region
 
@@ -1571,3 +1511,4 @@ class AlchemicalPhase(object):
 
         # We return only the randomized ligand positions to minimize MPI traffic.
         return ligand_positions
+

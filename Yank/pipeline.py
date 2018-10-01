@@ -33,7 +33,6 @@ from pdbfixer import PDBFixer
 from simtk import openmm, unit
 from simtk.openmm.app import PDBFile
 
-
 from . import utils, mpi
 
 logger = logging.getLogger(__name__)
@@ -803,35 +802,6 @@ def generate_pdbfixer_mutation_code(original_residue_name, residue_index, mutate
     return '{0:s}-{1:d}-{2:s}'.format(original_residue_name, residue_index, mutated_residue_name)
 
 
-def process_tool_directive(directives, option, dispatch, allowed_values, yields_value=False):
-    """Process a directive.
-
-    Parameters
-    ----------
-    option : str
-        The name of the option to be processed.
-        Will remove this option from `directives` once processed.
-    dispatch : function
-        The function to call.
-    allowed_values : list
-        If not None, the value of directives[option] will be checked against this list
-    yields_value : boolean, default False
-        Tells this function to expect a return from the dispatch function and give it back as needed
-    """
-    if option in directives:
-        value = directives[option]
-        # Validate options
-        if allowed_values is not None:
-            if value not in allowed_values:
-                raise ValueError("'{}' must be one of {}".format(option, allowed_values))
-        # Dispatch
-        output = dispatch(value)
-        # Delete the key once we've processed it
-        del directives[option]
-        if yields_value:
-            return output
-        return
-
 def apply_pdbfixer(input_file_path, output_file_path, directives):
     """
     Apply PDBFixer to make changes to the specified molecule.
@@ -865,6 +835,35 @@ def apply_pdbfixer(input_file_path, output_file_path, directives):
     fixer = PDBFixer(input_file_path)
     fixer.missingResidues = {}
 
+    def process_directive(option, dispatch, allowed_values, yields_value=False):
+        """Process a directive.
+
+        Parameters
+        ----------
+        option : str
+            The name of the option to be processed.
+            Will remove this option from `directives` once processed.
+        dispatch : function
+            The function to call.
+        allowed_values : list
+            If not None, the value of directives[option] will be checked against this list
+        yields_value : boolean, default False
+            Tells this function to expect a return from the dispatch function and give it back as needed
+        """
+        if option in directives:
+            value = directives[option]
+            # Validate options
+            if allowed_values is not None:
+                if value not in allowed_values:
+                    raise ValueError("'{}' must be one of {}".format(option, allowed_values))
+            # Dispatch
+            output = dispatch(value)
+            # Delete the key once we've processed it
+            del directives[option]
+            if yields_value:
+                return output
+            return
+
     # Dispatch functions
     # These won't be documented individually because they are so short
     def dispatch_pH(value):
@@ -876,7 +875,7 @@ def apply_pdbfixer(input_file_path, output_file_path, directives):
             raise ValueError("'ph' must be a floating-point number: found '{}'".format(value))
         return pH
 
-    pH = process_tool_directive(directives, 'ph', dispatch_pH, None, yields_value=True)
+    pH = process_directive('ph', dispatch_pH, None, yields_value=True)
 
     def add_missing_residues(value):
         if value == 'yes':
@@ -897,7 +896,6 @@ def apply_pdbfixer(input_file_path, output_file_path, directives):
             pdbfixer_mutations = [generate_pdbfixer_mutation_code(*decompose_mutation(mutation))
                                   for mutation in mutations.split('/')]
             logger.info('pdbfixer: Will make mutations {} to chain_id {}.'.format(pdbfixer_mutations, chain_id))
-
             fixer.applyMutations(pdbfixer_mutations, chain_id)
         else:
             logger.info('pdbfixer: No mutations will be applied since "WT" specified.')
@@ -932,11 +930,11 @@ def apply_pdbfixer(input_file_path, output_file_path, directives):
         directives['add_missing_atoms'] = 'heavy'
 
     # Dispatch directives
-    process_tool_directive(directives, 'add_missing_residues', add_missing_residues, [True, False])
-    process_tool_directive(directives, 'apply_mutations', apply_mutations, None)
-    process_tool_directive(directives, 'replace_nonstandard_residues', replace_nonstandard_residues, [True, False])
-    process_tool_directive(directives, 'remove_heterogens', remove_heterogens, ['all', 'water', 'none'])
-    process_tool_directive(directives, 'add_missing_atoms', add_missing_atoms, ['all', 'heavy', 'hydrogens', 'none'])
+    process_directive('add_missing_residues', add_missing_residues, [True, False])
+    process_directive('apply_mutations', apply_mutations, None)
+    process_directive('replace_nonstandard_residues', replace_nonstandard_residues, [True, False])
+    process_directive('remove_heterogens', remove_heterogens, ['all', 'water', 'none'])
+    process_directive('add_missing_atoms', add_missing_atoms, ['all', 'heavy', 'hydrogens', 'none'])
 
     # Check that there were no extra options
     if len(directives) > 0:
@@ -944,93 +942,6 @@ def apply_pdbfixer(input_file_path, output_file_path, directives):
 
     # Write the final structure
     PDBFile.writeFile(fixer.topology, fixer.positions, open(output_file_path, 'w'))
-
-
-def apply_modeller(input_file_path, output_file_path, directives):
-    """
-    Apply Salilab Modeller to make changes to the specified molecule.
-
-    Single mutants are supported in the form "T315I"
-    Double mutants are not currently supported.
-
-    The string "WT" makes no mutations.
-
-    Original PDB file numbering scheme is used.
-
-    Currently, only PDB files are supported.
-    modeller is used to make the mutations. You must have a license file installed for this to work
-
-    Parameters
-    ----------
-    input_file_path : str
-        Full file path to the file to read, including extensions
-    output_file_path : str
-        Full file path to the file to save, including extensions
-    directives : dict
-        Dict containing directives for modeller.
-    """
-
-    if not utils.is_modeller_installed():
-        raise ImportError('Modeller and license must be installed to use this feature.')
-    import modeller
-
-    directives = copy.deepcopy(directives)
-
-    # Silence unnecessary output to the log files
-    modeller.log.none()
-
-    # Create modeller environment and point it to the PDB file
-    env = modeller.environ()
-    atom_files_directory = os.path.dirname(input_file_path)
-    atom_file_name = os.path.basename(input_file_path)
-
-    # Read in topology and parameter files
-    env.libs.topology.read(file='$(LIB)/top_heav.lib')
-    env.libs.parameters.read(file='$(LIB)/par.lib')
-
-    env.io.atom_files_directory = [atom_files_directory]
-    alignment = modeller.alignment(env)
-    model = modeller.model(env, file=atom_file_name)
-    model_original_numbering = modeller.model(env, file=atom_file_name)
-    alignment.append_model(model, atom_files=atom_file_name, align_codes=atom_file_name)
-
-    def apply_mutations_modeller(value):
-        # Extract chain id
-        chain_id = None
-        if 'chain_id' in value:
-            chain_id = value['chain_id']
-            if chain_id == 'none':
-                chain_id = 0
-        # Extract mutations
-        mutations = value['mutations']
-        # Convert mutations to PDBFixer format
-        if mutations != 'WT':
-            modeller_mutations = [generate_pdbfixer_mutation_code(*decompose_mutation(mutation))
-                                  for mutation in mutations.split('/')]
-            if len(modeller_mutations) > 1:
-                raise ValueError('{} is a double mutant and not supported by Modeller currently.'.format(mutations))
-            else:
-                logger.info('modeller: Will make mutations {} to chain_id {}.'.format(modeller_mutations, chain_id))
-                sel = modeller.selection(model.chains[chain_id].residues[modeller_mutations[0].split('-')[1]])
-                sel.mutate(residue_type=modeller_mutations[0].split('-')[2])
-                alignment.append_model(model, align_codes=modeller_mutations[0])
-                model.clear_topology()
-                model.generate_topology(alignment[modeller_mutations[0]])
-                model.transfer_xyz(alignment)
-                model.build(initialize_xyz=False, build_method='INTERNAL_COORDINATES')
-
-        else:
-            logger.info('modeller: No mutations will be applied since "WT" specified.')
-
-    process_tool_directive(directives, 'apply_mutations', apply_mutations_modeller, None)
-
-    # Check that there were no extra options
-    if len(directives) > 0:
-        raise ValueError("The 'modeller:' block contained some nodes that it didn't know how to process: {}".format(directives))
-
-    # Write the final model
-    model.res_num_from(model_original_numbering, alignment)
-    model.write(file=output_file_path)
 
 
 def read_csv_lines(file_path, lines):
@@ -1233,10 +1144,6 @@ class SetupDatabase:
         elif 'pdbfixer' in molecule_descr:
             files_to_check = [('filepath', molecule_id_path + '.pdb')]
 
-        # If we have to make mutations using modeller, a new PDB should be created
-        elif 'modeller' in molecule_descr:
-            files_to_check = [('filepath', molecule_id_path + '.pdb')]
-
         # If a single structure must be extracted we search for output
         elif 'select' in molecule_descr:
             files_to_check = [('filepath', molecule_id_path + extension)]
@@ -1282,7 +1189,8 @@ class SetupDatabase:
             True if the system has already gone through the setup pipeline.
 
         """
-        if 'ligand' in self.systems[system_id] or 'solute' in self.systems[system_id]:
+        if 'ligand' in self.systems[system_id] or 'solute' in self.systems[system_id]\
+                or 'A' in self.systems[system_id]:
             system_files_paths = self.get_system_files_paths(system_id)
             is_setup = (os.path.exists(system_files_paths[0].position_path) and
                         os.path.exists(system_files_paths[0].parameters_path) and
@@ -1321,28 +1229,58 @@ class SetupDatabase:
         log_message = 'Setting up the systems for {} and {} using solvent {}'
 
         if 'receptor' in system_descr:  # binding free energy calculation
-            receptor_id = system_descr['receptor']
-            ligand_id = system_descr['ligand']
-            solvent_id = system_descr['solvent']
-            system_parameters = system_descr['leap']['parameters']
-            logger.info(log_message.format(receptor_id, ligand_id, solvent_id))
+            if 'ligand' in system_descr:
+                receptor_id = system_descr['receptor']
+                ligand_id = system_descr['ligand']
+                solvent_id = system_descr['solvent']
+                system_parameters = system_descr['leap']['parameters']
+                logger.info(log_message.format(receptor_id, ligand_id, solvent_id))
 
-            # solvent phase
-            logger.debug('Setting up solvent phase')
-            self._setup_system(system_files_paths[1].position_path, False,
-                               0, system_parameters, solvent_id, ligand_id)
+                # solvent phase
+                logger.debug('Setting up solvent phase')
+                self._setup_system(system_files_paths[1].position_path, False,
+                                   0, system_parameters, solvent_id, ligand_id)
 
-            try:
-                alchemical_charge = int(round(self.molecules[ligand_id]['net_charge']))
-            except KeyError:
-                alchemical_charge = 0
+                try:
+                    alchemical_charge = int(round(self.molecules[ligand_id]['net_charge']))
+                except KeyError:
+                    alchemical_charge = 0
 
-            # complex phase
-            logger.debug('Setting up complex phase')
-            self._setup_system(system_files_paths[0].position_path,
-                               system_descr['pack'], alchemical_charge,
-                               system_parameters, solvent_id, receptor_id,
-                               ligand_id)
+                # complex phase
+                logger.debug('Setting up complex phase')
+                self._setup_system(system_files_paths[0].position_path,
+                                   system_descr['pack'], alchemical_charge,
+                                   system_parameters, solvent_id, receptor_id,
+                                   ligand_id)
+            else:
+                log_message = 'Setting up the systems for {} and {} and {} using solvent {}'
+                receptor_id = system_descr['receptor']
+                ligand_A_id = system_descr['A']
+                ligand_B_id = system_descr['B']
+                solvent_id = system_descr['solvent']
+                system_parameters = system_descr['leap']['parameters']
+                logger.info(log_message.format(receptor_id, ligand_A_id, ligand_B_id, solvent_id))
+
+                #no solvent phase
+
+                alchemical_charge_A = int(round(self.molecules[ligand_A_id]['net_charge']))
+                alchemical_charge_B = int(round(self.molecules[ligand_B_id]['net_charge']))
+                ### THIS SHOULD BE EQUAL AND OPPOSITE, EQUAL FOR TESTING ONLY
+                if alchemical_charge_A == alchemical_charge_B:
+                    alchemical_charge = 0
+                    print(alchemical_charge)
+                else:
+                    ValueError('For Coupled topologies ligands A and B should have opposite charge'
+                               ' or method is redundant')
+
+                # coupled phase
+                logger.debug('Setting up coupled phase')
+                self._setup_system(system_files_paths[0].position_path,
+                                   system_descr['pack'], alchemical_charge,
+                                   system_parameters, solvent_id, receptor_id,
+                                   ligand_A_id, ligand_B_id)
+                #print(system_descr['A'])
+                #print(system_descr['B'])
         else:  # partition/solvation free energy calculation
             solute_id = system_descr['solute']
             solvent1_id = system_descr['solvent1']
@@ -1555,14 +1493,6 @@ class SetupDatabase:
                 apply_pdbfixer(mol_descr['filepath'], output_file_path, mol_descr['pdbfixer'])
                 mol_descr['filepath'] = output_file_path
 
-            # Apply modeller if requested
-            if 'modeller' in mol_descr:
-                if extension not in ['.pdb', '.PDB']:
-                    raise RuntimeError('Cannot apply modeller to {} files; a .pdb file is required.'.format(extension[1:]))
-                output_file_path = os.path.join(mol_dir, mol_id + '.pdb')
-                apply_modeller(mol_descr['filepath'], output_file_path, mol_descr['modeller'])
-                mol_descr['filepath'] = output_file_path
-
             # Generate missing molecules with OpenEye. At the end of parametrization
             # we update the 'filepath' key also for OpenEye-generated molecules so
             # we don't need to keep track of the molecules we have already generated
@@ -1764,7 +1694,7 @@ class SetupDatabase:
         # Load all parameters
         # --------------------
         tleap.new_section('Load parameters')
-
+        print(molecule_ids)
         for mol_id in molecule_ids:
             molecule_parameters = self.molecules[mol_id]['leap']['parameters']
             # Track loaded water models
@@ -1788,7 +1718,6 @@ class SetupDatabase:
             # is too far away from the molecule we want to pull it closer
             # TODO this check should be available even without OpenEye
             if pack and utils.is_openeye_installed(oetools=('oechem',)):
-
                 # Load atom positions of all molecules
                 positions = [0 for _ in molecule_ids]
                 for i, mol_id in enumerate(molecule_ids):
